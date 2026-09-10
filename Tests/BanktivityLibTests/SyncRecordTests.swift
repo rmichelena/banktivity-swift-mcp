@@ -188,6 +188,18 @@ struct SyncRecordTests {
         #expect(xml.contains("<field type=\"decimal\" name=\"accountAmount\">-12.34</field>"))
         #expect(xml.contains("<field type=\"decimal\" name=\"transacitonAmount\">-12.34</field>"))
         #expect(created.title == "ADVISORY FEE")
+
+        let txRequest = NSFetchRequest<NSManagedObject>(entityName: "Transaction")
+        txRequest.predicate = NSPredicate(format: "pTitle == %@", "ADVISORY FEE")
+        txRequest.fetchLimit = 1
+        let tx = try #require(try vault.container.viewContext.fetch(txRequest).first)
+        let txType = try #require(tx.value(forKey: "pTransactionType") as? NSManagedObject)
+        let typeUUID = BaseRepository.stringValue(txType, "pUniqueID")
+        let baseTypeCode = (txType.value(forKey: "pBaseType") as? NSNumber)?.intValue
+            ?? BaseRepository.intValue(txType, "pBaseType")
+        let baseTypeName = TransactionRepository.transactionTypeBaseTypeName(baseTypeCode)
+        #expect(xml.contains("<field enum=\"IGGCSyncAccountingTransactionBaseType\" name=\"baseType\">\(baseTypeName)</field>"))
+        #expect(xml.contains("TransactionTypeV2:\(typeUUID)"))
     }
 
     @Test("updateSecurityLineItem can repair cash line item amounts and sync blob")
