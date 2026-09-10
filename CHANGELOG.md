@@ -2,6 +2,12 @@
 
 ## Unreleased
 
+- Add optional `transaction_type` to MCP `create_transaction` and CLI
+  `transactions create --transaction-type`. When omitted, infer only deposit,
+  withdrawal, or transfer from asset/liability line items (transfer whenever
+  two or more distinct bank accounts are involved, including fee/FX transfers)
+  instead of picking the first arbitrary TransactionType (often Return Of Capital).
+  Investment types (`buy`, `dividend`, `check`, etc.) must be passed explicitly.
 - Preserve Banktivity date-only calendar days in the host time zone instead of
   parsing and formatting them as UTC instants; full ISO 8601 timestamps remain UTC
 
