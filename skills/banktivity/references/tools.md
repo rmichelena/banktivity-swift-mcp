@@ -348,6 +348,7 @@ Create a new transaction with line items.
     "date": { "type": "string", "description": "Transaction date in ISO format (YYYY-MM-DD)" },
     "title": { "type": "string", "description": "Transaction title/payee" },
     "note": { "type": "string", "description": "Optional note" },
+    "transaction_type": { "type": "string", "description": "Optional kebab-case slug (not the display name reads return). When omitted, only deposit, withdrawal, or transfer is inferred from asset/liability line items; investment types must be passed explicitly. Accepted set is TransactionRepository.transactionTypeNames." },
     "line_items": { "type": "array", "description": "Line items: [{account_id, amount, memo?}]" }
   },
   "required": ["date", "title", "line_items"]
