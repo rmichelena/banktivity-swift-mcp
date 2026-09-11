@@ -114,12 +114,21 @@ public final class TransactionRepository: BaseRepository, @unchecked Sendable {
 
     // MARK: - Write Operations
 
-    /// Create a new transaction with line items
+    /// Create a new transaction with line items.
+    ///
+    /// When `transactionType` is provided it is resolved the same way as `update`
+    /// (canonical name → `pBaseType` → TransactionType entity). When omitted, only
+    /// deposit / withdrawal / transfer are inferred from asset/liability line items:
+    /// transfer whenever two or more distinct bank accounts are present (including
+    /// fee and FX transfers); otherwise deposit (net inflow) or withdrawal (net
+    /// outflow) on the single bank account. Investment types (`buy`, `dividend`,
+    /// `check`, etc.) must be passed explicitly.
     public func create(
         date: String,
         title: String,
         note: String? = nil,
-        lineItems: [(accountId: Int, amount: Double, memo: String?)]
+        lineItems: [(accountId: Int, amount: Double, memo: String?)],
+        transactionType: String? = nil
     ) throws -> TransactionDTO {
         struct SyncInfo: Sendable {
             let txUUID: String
@@ -143,34 +152,14 @@ public final class TransactionRepository: BaseRepository, @unchecked Sendable {
             Self.setNow(tx, "pModificationDate")
             Self.setDate(tx, "pDate", isoString: date)
 
-            // Set default transaction type (fetch the first available)
-            let typeRequest = NSFetchRequest<NSManagedObject>(entityName: "TransactionType")
-            typeRequest.fetchLimit = 1
-            let txType = try ctx.fetch(typeRequest).first
-            if let txType = txType {
-                tx.setValue(txType, forKey: "pTransactionType")
-            }
-
-            // Was a three-case switch over base types 0 and 1 that fell through to
-            // "deposit" for everything else -- so a withdrawal, a transfer or a
-            // check was described in its own sync record as a deposit. 0 is not a
-            // base type at all; Deposit is 1 and Withdrawal is 2.
-            let txTypeBaseTypeCode: Int16 = {
-                guard let txType = txType else { return 1 }
-                // `Int16(_:)` traps out of range, and this value comes from the
-                // store rather than from us. 0 is not a base type, so an
-                // unreadable one resolves to no enum name and the sync record is
-                // skipped -- which is the same answer, without the crash.
-                return Int16(exactly: Self.intValue(txType, "pBaseType")) ?? 0
-            }()
-            let txTypeUUID = txType.map { Self.stringValue($0, "pUniqueID") } ?? ""
-
             // Create line items
             var currencySet = false
             var currencyUUID = ""
             var syncLineItems: [SyncBlobUpdater.SyncLineItem] = []
 
             var totalAmount = 0.0
+            var bankNet = 0.0
+            var bankAccountIds = Set<Int>()
 
             for liInput in lineItems {
                 guard let account = try fetchByPK(entityName: "Account", pk: liInput.accountId, in: ctx) else {
@@ -178,6 +167,12 @@ public final class TransactionRepository: BaseRepository, @unchecked Sendable {
                 }
 
                 let accountUUID = Self.stringValue(account, "pUniqueID")
+                let accountClass = (account.value(forKey: "pAccountClass") as? NSNumber)?.intValue
+                    ?? Self.intValue(account, "pAccountClass")
+                if assetClasses.contains(accountClass) || liabilityClasses.contains(accountClass) {
+                    bankNet += liInput.amount
+                    bankAccountIds.insert(liInput.accountId)
+                }
 
                 // Use the first account's currency for the transaction
                 if !currencySet, let currency = Self.relatedObject(account, "currency") {
@@ -229,10 +224,32 @@ public final class TransactionRepository: BaseRepository, @unchecked Sendable {
                 ))
             }
 
+            let resolvedType: (object: NSManagedObject, baseTypeName: String, uuid: String)?
+            if let transactionType {
+                resolvedType = try Self.requireTransactionType(named: transactionType, in: ctx)
+            } else {
+                let inferred = Self.inferredTransactionTypeName(
+                    bankNet: bankNet, distinctBankAccountCount: bankAccountIds.count
+                )
+                if let found = try Self.fetchTransactionType(named: inferred, in: ctx) {
+                    resolvedType = found
+                } else if let found = try Self.fetchTransactionType(named: "deposit", in: ctx) {
+                    resolvedType = found
+                } else {
+                    resolvedType = try Self.fetchAnyTransactionType(in: ctx)
+                }
+            }
+            if let resolvedType {
+                tx.setValue(resolvedType.object, forKey: "pTransactionType")
+            }
+
             return SyncInfo(
                 txUUID: txUUID, currencyUUID: currencyUUID,
-                transactionTypeBaseTypeCode: txTypeBaseTypeCode,
-                transactionTypeUUID: txTypeUUID,
+                transactionTypeBaseTypeCode: {
+                    guard let resolvedType else { return Int16(1) }
+                    return Int16(exactly: Self.intValue(resolvedType.object, "pBaseType")) ?? 0
+                }(),
+                transactionTypeUUID: resolvedType?.uuid ?? "",
                 lineItems: syncLineItems
             )
         }
@@ -286,19 +303,10 @@ public final class TransactionRepository: BaseRepository, @unchecked Sendable {
             }
             if let cleared = cleared { tx.setValue(cleared, forKey: "pCleared") }
             if let transactionType = transactionType {
-                let baseType = Self.transactionTypeBaseTypeCode(transactionType)
-                guard let baseType = baseType else {
-                    throw ToolError.invalidInput("Unknown transaction type: \(transactionType). Valid types: \(Self.transactionTypeNames)")
-                }
-                let typeRequest = NSFetchRequest<NSManagedObject>(entityName: "TransactionType")
-                typeRequest.predicate = NSPredicate(format: "pBaseType == %d", baseType)
-                typeRequest.fetchLimit = 1
-                guard let txType = try ctx.fetch(typeRequest).first else {
-                    throw ToolError.notFound("TransactionType entity not found for base type \(baseType)")
-                }
-                tx.setValue(txType, forKey: "pTransactionType")
-                newTxTypeBaseTypeCode = Int16(baseType)
-                newTxTypeUUID = Self.stringValue(txType, "pUniqueID")
+                let resolved = try Self.requireTransactionType(named: transactionType, in: ctx)
+                tx.setValue(resolved.object, forKey: "pTransactionType")
+                newTxTypeBaseTypeCode = Int16(exactly: Self.intValue(resolved.object, "pBaseType")) ?? 0
+                newTxTypeUUID = resolved.uuid
             }
             Self.setNow(tx, "pModificationDate")
 
@@ -584,6 +592,61 @@ public final class TransactionRepository: BaseRepository, @unchecked Sendable {
     }
 
     // MARK: - Transaction Type Mapping
+
+    /// Infer deposit / withdrawal / transfer from asset/liability line items.
+    /// Income and expense category lines are ignored. Transfer is inferred whenever
+    /// two or more distinct bank accounts are involved (including fee and FX
+    /// transfers that do not net to zero). Deposit and withdrawal are used only
+    /// when a single distinct bank account is present.
+    static func inferredTransactionTypeName(bankNet: Double, distinctBankAccountCount: Int) -> String {
+        if distinctBankAccountCount >= 2 {
+            return "transfer"
+        }
+        if bankNet < -0.001 {
+            return "withdrawal"
+        }
+        return "deposit"
+    }
+
+    static func requireTransactionType(
+        named name: String,
+        in ctx: NSManagedObjectContext
+    ) throws -> (object: NSManagedObject, baseTypeName: String, uuid: String) {
+        guard let baseType = transactionTypeBaseTypeCode(name) else {
+            throw ToolError.invalidInput("Unknown transaction type: \(name). Valid types: \(transactionTypeNames)")
+        }
+        guard let resolved = try fetchTransactionType(named: name, in: ctx) else {
+            throw ToolError.notFound("TransactionType entity not found for \(transactionTypeBaseTypeName(baseType))")
+        }
+        return resolved
+    }
+
+    static func fetchTransactionType(
+        named name: String,
+        in ctx: NSManagedObjectContext
+    ) throws -> (object: NSManagedObject, baseTypeName: String, uuid: String)? {
+        guard let baseType = transactionTypeBaseTypeCode(name) else { return nil }
+        let typeRequest = NSFetchRequest<NSManagedObject>(entityName: "TransactionType")
+        typeRequest.predicate = NSPredicate(format: "pBaseType == %d", baseType)
+        typeRequest.fetchLimit = 1
+        guard let txType = try ctx.fetch(typeRequest).first else { return nil }
+        return (txType, transactionTypeBaseTypeName(baseType), stringValue(txType, "pUniqueID"))
+    }
+
+    /// Last-resort lookup when the inferred type is missing from the vault.
+    /// Sorted by `pBaseType` so Deposit (1) wins over later types such as
+    /// Return Of Capital (310) instead of picking an arbitrary first row.
+    static func fetchAnyTransactionType(
+        in ctx: NSManagedObjectContext
+    ) throws -> (object: NSManagedObject, baseTypeName: String, uuid: String)? {
+        let typeRequest = NSFetchRequest<NSManagedObject>(entityName: "TransactionType")
+        typeRequest.sortDescriptors = [NSSortDescriptor(key: "pBaseType", ascending: true)]
+        typeRequest.fetchLimit = 1
+        guard let txType = try ctx.fetch(typeRequest).first else { return nil }
+        let baseType = (txType.value(forKey: "pBaseType") as? NSNumber)?.intValue
+            ?? Self.intValue(txType, "pBaseType")
+        return (txType, transactionTypeBaseTypeName(baseType), stringValue(txType, "pUniqueID"))
+    }
 
     /// Slug -> Core Data base type, and the ONLY statement of what
     /// `--transaction-type` accepts.
