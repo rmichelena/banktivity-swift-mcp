@@ -99,6 +99,7 @@ Use `get_account_reconciliation_status` through MCP or `banktivity-cli statement
 
 | Tool | Key Arguments | Notes |
 |---|---|---|
+| `create_transaction` | `--date YYYY-MM-DD --title "Payee" --line-items '[{...}]' [--transaction-type]` | Create a transaction. Omitted `--transaction-type` infers only deposit / withdrawal / transfer from bank-account lines. Investment types (`buy`, `dividend`, `check`, etc.) must be passed explicitly. |
 | `update_transaction` | `--transaction_id N [--title] [--note] [--date] [--cleared] [--transaction_type]` | Update title, note, date, cleared, or transaction type (deposit, withdrawal, buy, sell, etc.) |
 | `recategorize_transaction` | `--transaction_id N --category_id N` or `--category_name "Name"` | Use `--category_id` for subcategories |
 | `bulk_recategorize_by_payee` | `--payee_pattern "pat" --category_id N --dry_run true --uncategorized_only true` | **Always dry_run first** |
